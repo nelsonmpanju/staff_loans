@@ -210,6 +210,9 @@ def make_loan_disbursement_journal_entry(loan, company,applicant,debit_account,a
 def on_submit(doc, method):
     if frappe.db.exists ("Staff Loan", doc.cheque_no):
         cs_loan = frappe.get_doc("Staff Loan", doc.cheque_no)
+        # Skip Journal Entry processing for opening balance loans
+        if cs_loan.is_opening_balance:
+            frappe.throw("Cannot create Journal Entry for Opening Balance Loan {0}. It is automatically disbursed.".format(doc.cheque_no))
         if cs_loan.loan_amount == doc.total_debit:
             cs_loan.status = "Disbursed"
             cs_loan.disbursement_date = doc.posting_date

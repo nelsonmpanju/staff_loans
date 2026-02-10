@@ -8,6 +8,7 @@ frappe.ui.form.on("Staff Loan", {
 			'Loan Write Off': function() { frm.trigger('make_loan_write_off_entry') },
 			'Loan Repayment By External Sources': function() { frm.trigger('make_loan_write_off_by_external_sources_entry') },
 		}
+
 		frm.set_query("applicant", function () {
 			return {
 				"filters": {
@@ -16,6 +17,24 @@ frappe.ui.form.on("Staff Loan", {
 			};
 		});
 	},
+
+	after_submit: function(frm) {
+		// Handle opening balance loan disbursement
+		if (frm.doc.is_opening_balance) {
+			frappe.call({
+				method: "staff_loans.staff_loan_management.doctype.staff_loan.staff_loan.disburse_opening_balance",
+				args: {
+					loan_name: frm.doc.name
+				},
+				callback: function(r) {
+					if (r.message) {
+						frm.reload_doc();
+					}
+				}
+			});
+		}
+	},
+
 	onload: function (frm) {
 		// Ignore loan security pledge on cancel of loan
 		// frm.ignore_doctypes_on_cancel_all = ["Loan Security Pledge"];
@@ -317,7 +336,8 @@ frappe.ui.form.on("Staff Loan", {
 
 		if (frm.doc.docstatus == 1) {
 
-			if (["Sanctioned", "Partially Disbursed"].includes(frm.doc.status)) {
+			// Only show Journal Entry button for non-opening balance loans
+			if (["Sanctioned", "Partially Disbursed"].includes(frm.doc.status) && !frm.doc.is_opening_balance) {
 				frm.add_custom_button(__('Loan Disbursement Journal Entry'), function() {
 					frm.trigger("make_loan_disbursement_journal_entry");
 				},__('Create'));
@@ -332,7 +352,7 @@ frappe.ui.form.on("Staff Loan", {
 				},__('Create'));
 			}
 
-		} 
+		}
 		frm.trigger("toggle_fields");
 	},
 

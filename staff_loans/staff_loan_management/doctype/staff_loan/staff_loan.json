@@ -22,6 +22,7 @@
   "repayment_schedule_type",
   "loan_amount",
   "is_secured_loan",
+  "is_opening_balance",
   "disbursement_date",
   "closure_date",
   "disbursed_amount",
@@ -126,8 +127,7 @@
    "in_standard_filter": 1,
    "label": "Status",
    "no_copy": 1,
-   "options": "Sanctioned\nPartially Disbursed\nDisbursed\nLoan Closure Requested\nClosed",
-   "read_only": 1
+   "options": "Sanctioned\nPartially Disbursed\nDisbursed\nLoan Closure Requested\nClosed"
   },
   {
    "fieldname": "section_break_8",
@@ -166,6 +166,13 @@
    "label": "Is Secured Loan",
    "print_hide": 1,
    "report_hide": 1
+  },
+  {
+   "default": "0",
+   "description": "If checked, disbursement will not create accounting entries",
+   "fieldname": "is_opening_balance",
+   "fieldtype": "Check",
+   "label": "Is Opening Balance"
   },
   {
    "allow_on_submit": 1,
@@ -496,7 +503,7 @@
    "link_fieldname": "loan"
   }
  ],
- "modified": "2024-06-18 15:28:33.279996",
+ "modified": "2026-01-23 17:02:20.682690",
  "modified_by": "Administrator",
  "module": "Staff Loan Management",
  "name": "Staff Loan",
@@ -523,6 +530,7 @@
    "role": "Employee"
   }
  ],
+ "row_format": "Dynamic",
  "search_fields": "posting_date",
  "sort_field": "creation",
  "sort_order": "DESC",

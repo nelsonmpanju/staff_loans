@@ -16,11 +16,11 @@ class StaffLoanRepayment(Document):
 		self.validate_amount()
 		
 	def on_submit(self):
-		self.reschedule_repayment_schedule()
 		if self.repayment_type == "Loan Write Off":
+			self.reschedule_repayment_schedule()
 			self.update_outstanding_amount()
 		elif self.repayment_type == "External Sources":
-			self.update_outstanding_amount2()
+			self.process_external_repayment()
 		self.create_journal_entry()
 
 	def create_journal_entry(self):
@@ -72,11 +72,11 @@ class StaffLoanRepayment(Document):
 			journal_entry.submit()
 
 	def on_cancel(self):
-		self.cancel_reschedule_repayment_schedule()
-		# self.ignore_linked_doctypes = ("Staff Loan")
 		if self.repayment_type == "Loan Write Off":
+			self.cancel_reschedule_repayment_schedule()
 			self.update_outstanding_amount(cancel=1)
 		elif self.repayment_type == "External Sources":
+			self.cancel_external_repayment()
 			self.update_outstanding_amount2(cancel=1)
 
 	def update_outstanding_amount(self, cancel=0):
@@ -102,6 +102,111 @@ class StaffLoanRepayment(Document):
 			rep_amount += self.repayment_amount
 
 		frappe.db.set_value("Staff Loan", self.loan, "total_amount_paid", rep_amount)
+
+	def process_external_repayment(self):
+		"""
+		Process external/cash repayment by marking schedule installments as paid
+		step-by-step without touching Additional Salary documents.
+		"""
+		staff_loan = frappe.get_doc("Staff Loan", self.loan)
+		repayment_amount = self.repayment_amount
+
+		# Get unpaid schedule items sorted by payment_date
+		unpaid_items = []
+		for d in staff_loan.repayment_schedule:
+			if d.is_paid == 0:
+				unpaid_items.append(d)
+
+		# Sort by payment_date to pay earliest first
+		unpaid_items.sort(key=lambda x: x.payment_date)
+
+		# Mark installments as paid step-by-step
+		for item in unpaid_items:
+			if repayment_amount <= 0:
+				break
+
+			if repayment_amount >= item.total_payment:
+				# Full payment of this installment
+				item.is_paid = 1
+				item.outsource = 1
+				item.repayment_reference = self.name
+				repayment_amount -= item.total_payment
+			else:
+				# Partial payment - split the installment
+				original_amount = item.total_payment
+				item.total_payment = repayment_amount
+				item.principal_amount = repayment_amount
+				item.is_paid = 1
+				item.outsource = 1
+				item.repayment_reference = self.name
+
+				# Create new installment for remaining amount
+				remaining = original_amount - repayment_amount
+				staff_loan.append("repayment_schedule", {
+					"payment_date": item.payment_date,
+					"principal_amount": remaining,
+					"total_payment": remaining,
+					"balance_loan_amount": item.balance_loan_amount,
+					"is_paid": 0
+				})
+				repayment_amount = 0
+
+		# Recalculate balance_loan_amount for all items
+		balance = staff_loan.loan_amount
+		for i, d in enumerate(sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))):
+			if d.is_paid:
+				balance -= d.total_payment
+			d.balance_loan_amount = balance
+			d.idx = i + 1
+
+		staff_loan.save()
+
+		# Update total_amount_paid on Staff Loan
+		self.update_outstanding_amount2()
+
+	def cancel_external_repayment(self):
+		"""
+		Cancel external repayment by unmarking schedule installments
+		that were paid by this repayment.
+		"""
+		staff_loan = frappe.get_doc("Staff Loan", self.loan)
+
+		# Find and unmark items paid by this repayment
+		items_to_remove = []
+		for d in staff_loan.repayment_schedule:
+			if d.repayment_reference == self.name:
+				# Check if this was a split item (created during partial payment)
+				# by checking if there's another item with same date that's unpaid
+				has_unpaid_sibling = False
+				for other in staff_loan.repayment_schedule:
+					if other.payment_date == d.payment_date and other.is_paid == 0 and other.name != d.name:
+						has_unpaid_sibling = True
+						# Merge back: add this amount to the unpaid sibling
+						other.total_payment += d.total_payment
+						other.principal_amount += d.principal_amount
+						items_to_remove.append(d)
+						break
+
+				if not has_unpaid_sibling:
+					# Just unmark as paid
+					d.is_paid = 0
+					d.outsource = 0
+					d.repayment_reference = None
+
+		# Remove split items
+		for item in items_to_remove:
+			staff_loan.remove(item)
+
+		# Recalculate balance_loan_amount and idx
+		balance = staff_loan.loan_amount
+		sorted_schedule = sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))
+		for i, d in enumerate(sorted_schedule):
+			if d.is_paid:
+				balance -= d.total_payment
+			d.balance_loan_amount = balance
+			d.idx = i + 1
+
+		staff_loan.save()
 
 	def validate_amount(self):
 		precision = cint(frappe.db.get_default("currency_precision")) or 2

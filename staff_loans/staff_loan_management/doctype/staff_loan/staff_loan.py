@@ -134,7 +134,9 @@ class StaffLoan(AccountsController):
 		# self.accrue_loan_interest()
 
 	def after_submit(self):
-		self.set_status_from_docstatus()
+		# For non-opening balance loans, set status from docstatus
+		if not self.is_opening_balance:
+			self.set_status_from_docstatus()
 
 	def on_cancel(self):
 		self.before_cancel_document()
@@ -164,6 +166,21 @@ class StaffLoan(AccountsController):
 
 	def set_status_from_docstatus(self):
 		self.status = self.docstatus
+
+	def disburse_opening_balance_loan(self):
+		"""
+		Disburse opening balance loan without creating accounting entries.
+		Sets the loan status to Disbursed directly.
+		"""
+		# Update each field individually using db_set
+		self.db_set("status", "Disbursed", update_modified=False)
+		self.db_set("disbursement_date", self.posting_date, update_modified=False)
+		self.db_set("disbursed_amount", self.loan_amount, update_modified=False)
+
+		frappe.msgprint(_("Opening Balance Loan {0} has been disbursed without creating accounting entries").format(
+			frappe.bold(self.name)
+		))
+
 
 	def set_missing_fields(self):
 		if not self.company:
@@ -544,3 +561,34 @@ def make_refund_jv(loan, amount=0, reference_number=None, reference_date=None, s
 		refund_jv.submit()
 
 	return refund_jv
+
+
+@frappe.whitelist()
+def disburse_opening_balance(loan_name):
+	"""
+	Whitelisted method to disburse opening balance loan.
+	Called from JavaScript after document submission.
+	"""
+	loan = frappe.get_doc("Staff Loan", loan_name)
+
+	if not loan.is_opening_balance:
+		frappe.throw(_("This loan is not marked as Opening Balance"))
+
+	if loan.docstatus != 1:
+		frappe.throw(_("Loan must be submitted first"))
+
+	if loan.status == "Disbursed":
+		return {"status": "already_disbursed"}
+
+	# Update the loan status directly in database
+	frappe.db.set_value("Staff Loan", loan_name, {
+		"status": "Disbursed",
+		"disbursement_date": loan.posting_date,
+		"disbursed_amount": loan.loan_amount
+	}, update_modified=False)
+
+	frappe.msgprint(_("Opening Balance Loan {0} has been disbursed without creating accounting entries").format(
+		frappe.bold(loan_name)
+	))
+
+	return {"status": "success"}
