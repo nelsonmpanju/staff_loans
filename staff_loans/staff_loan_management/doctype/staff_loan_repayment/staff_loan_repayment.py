@@ -24,11 +24,12 @@ class StaffLoanRepayment(Document):
 		self.create_journal_entry()
 
 	def create_journal_entry(self):
+		posting_date = self.payment_date or nowdate()
 		if self.repayment_type == "External Sources":
 			journal_entry = frappe.new_doc("Journal Entry")
 			journal_entry.voucher_type = "Journal Entry"
 			journal_entry.company = self.company
-			journal_entry.posting_date = nowdate()
+			journal_entry.posting_date = posting_date
 			journal_entry.user_remark = "Loan Repayment \n" + self.description
 			journal_entry.cheque_no = self.name
 			journal_entry.cheque_date = self.cheque_date
@@ -51,7 +52,7 @@ class StaffLoanRepayment(Document):
 			journal_entry = frappe.new_doc("Journal Entry")
 			journal_entry.voucher_type = "Journal Entry"
 			journal_entry.company = self.company
-			journal_entry.posting_date = nowdate()
+			journal_entry.posting_date = posting_date
 			journal_entry.user_remark = "Loan Write Off"
 			journal_entry.cheque_no = self.name
 			journal_entry.cheque_date = self.cheque_date
@@ -77,7 +78,6 @@ class StaffLoanRepayment(Document):
 			self.update_outstanding_amount(cancel=1)
 		elif self.repayment_type == "External Sources":
 			self.cancel_external_repayment()
-			self.update_outstanding_amount2(cancel=1)
 
 	def update_outstanding_amount(self, cancel=0):
 		written_off_amount = frappe.db.get_value("Staff Loan", self.loan, "written_off_amount")
@@ -105,106 +105,170 @@ class StaffLoanRepayment(Document):
 
 	def process_external_repayment(self):
 		"""
-		Process external/cash repayment by marking schedule installments as paid
-		step-by-step without touching Additional Salary documents.
+		Process external/cash repayment:
+		1. Cancel Additional Salary entries linked to unpaid schedule rows
+		2. Remove all unpaid schedule entries
+		3. Add a paid entry for the external payment
+		4. Redistribute remaining balance equally across new monthly installments
 		"""
 		staff_loan = frappe.get_doc("Staff Loan", self.loan)
-		repayment_amount = self.repayment_amount
+		monthly_repayment_amount = staff_loan.monthly_repayment_amount
 
-		# Get unpaid schedule items sorted by payment_date
-		unpaid_items = []
+		# Cancel Additional Salary entries linked to unpaid schedule rows
 		for d in staff_loan.repayment_schedule:
-			if d.is_paid == 0:
-				unpaid_items.append(d)
+			if d.is_paid == 0 and d.payment_reference:
+				if frappe.db.exists("Additional Salary", d.payment_reference):
+					add_sal = frappe.get_doc("Additional Salary", d.payment_reference)
+					if add_sal.docstatus == 1:
+						add_sal.cancel()
 
-		# Sort by payment_date to pay earliest first
-		unpaid_items.sort(key=lambda x: x.payment_date)
+		# Determine next payment date from last paid salary entry
+		paid_dates = [d.payment_date for d in staff_loan.repayment_schedule if d.is_paid == 1]
+		if paid_dates:
+			next_date = max(paid_dates).replace(day=1) + relativedelta(months=1)
+		else:
+			next_date = (staff_loan.repayment_start_date or self.payment_date).replace(day=1)
 
-		# Mark installments as paid step-by-step
-		for item in unpaid_items:
-			if repayment_amount <= 0:
-				break
-
-			if repayment_amount >= item.total_payment:
-				# Full payment of this installment
-				item.is_paid = 1
-				item.outsource = 1
-				item.repayment_reference = self.name
-				repayment_amount -= item.total_payment
-			else:
-				# Partial payment - split the installment
-				original_amount = item.total_payment
-				item.total_payment = repayment_amount
-				item.principal_amount = repayment_amount
-				item.is_paid = 1
-				item.outsource = 1
-				item.repayment_reference = self.name
-
-				# Create new installment for remaining amount
-				remaining = original_amount - repayment_amount
-				staff_loan.append("repayment_schedule", {
-					"payment_date": item.payment_date,
-					"principal_amount": remaining,
-					"total_payment": remaining,
-					"balance_loan_amount": item.balance_loan_amount,
-					"is_paid": 0
+		# Collect paid entries to keep (exclude any existing entry for THIS repayment to avoid duplicates)
+		paid_entries = []
+		for d in staff_loan.repayment_schedule:
+			if d.is_paid == 1 and d.repayment_reference != self.name:
+				paid_entries.append({
+					"payment_date": d.payment_date,
+					"principal_amount": d.principal_amount,
+					"total_payment": d.total_payment,
+					"is_paid": 1,
+					"outsource": getattr(d, "outsource", 0),
+					"repayment_reference": d.repayment_reference,
+					"payment_reference": d.payment_reference,
 				})
-				repayment_amount = 0
 
-		# Recalculate balance_loan_amount for all items
-		balance = staff_loan.loan_amount
-		for i, d in enumerate(sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))):
-			if d.is_paid:
-				balance -= d.total_payment
-			d.balance_loan_amount = balance
+		# Rebuild schedule from scratch
+		staff_loan.repayment_schedule = []
+
+		# Re-add existing paid entries
+		balance = flt(staff_loan.loan_amount)
+		for entry in paid_entries:
+			balance -= flt(entry["total_payment"])
+			entry["balance_loan_amount"] = balance
+			staff_loan.append("repayment_schedule", entry)
+
+		# Calculate remaining balance after external payment
+		remaining_balance = flt(balance) - flt(self.repayment_amount)
+
+		# Add paid entry for the external payment
+		staff_loan.append("repayment_schedule", {
+			"payment_date": self.payment_date,
+			"principal_amount": self.repayment_amount,
+			"total_payment": self.repayment_amount,
+			"balance_loan_amount": remaining_balance,
+			"is_paid": 1,
+			"outsource": 1,
+			"repayment_reference": self.name,
+		})
+
+		# Create new equal installments for remaining balance
+		if remaining_balance > 0 and monthly_repayment_amount > 0:
+			payment_date = next_date
+			bal = remaining_balance
+			while bal > 0:
+				installment = min(flt(bal), flt(monthly_repayment_amount))
+				bal = flt(bal - installment)
+				staff_loan.append("repayment_schedule", {
+					"payment_date": payment_date,
+					"principal_amount": installment,
+					"total_payment": installment,
+					"balance_loan_amount": bal,
+					"is_paid": 0,
+				})
+				payment_date = payment_date + relativedelta(months=1)
+
+		# Re-index and recalculate balances in correct order
+		sorted_schedule = sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))
+		balance = flt(staff_loan.loan_amount)
+		for i, d in enumerate(sorted_schedule):
 			d.idx = i + 1
+			if d.is_paid:
+				balance -= flt(d.total_payment)
+			d.balance_loan_amount = balance
 
 		staff_loan.save()
 
-		# Update total_amount_paid on Staff Loan
-		self.update_outstanding_amount2()
-
 	def cancel_external_repayment(self):
 		"""
-		Cancel external repayment by unmarking schedule installments
-		that were paid by this repayment.
+		Cancel external repayment:
+		1. Cancel Additional Salary entries linked to unpaid schedule rows
+		2. Remove external payment entry and all unpaid rows
+		3. Redistribute remaining balance (with repayment added back) equally
 		"""
 		staff_loan = frappe.get_doc("Staff Loan", self.loan)
+		monthly_repayment_amount = staff_loan.monthly_repayment_amount
 
-		# Find and unmark items paid by this repayment
-		items_to_remove = []
+		# Cancel Additional Salary entries linked to unpaid schedule rows
 		for d in staff_loan.repayment_schedule:
-			if d.repayment_reference == self.name:
-				# Check if this was a split item (created during partial payment)
-				# by checking if there's another item with same date that's unpaid
-				has_unpaid_sibling = False
-				for other in staff_loan.repayment_schedule:
-					if other.payment_date == d.payment_date and other.is_paid == 0 and other.name != d.name:
-						has_unpaid_sibling = True
-						# Merge back: add this amount to the unpaid sibling
-						other.total_payment += d.total_payment
-						other.principal_amount += d.principal_amount
-						items_to_remove.append(d)
-						break
+			if d.is_paid == 0 and d.payment_reference:
+				if frappe.db.exists("Additional Salary", d.payment_reference):
+					add_sal = frappe.get_doc("Additional Salary", d.payment_reference)
+					if add_sal.docstatus == 1:
+						add_sal.cancel()
 
-				if not has_unpaid_sibling:
-					# Just unmark as paid
-					d.is_paid = 0
-					d.outsource = 0
-					d.repayment_reference = None
+		# Keep only salary-paid entries (exclude external payment entry and unpaid rows)
+		paid_entries = []
+		for d in staff_loan.repayment_schedule:
+			if d.is_paid == 1 and d.repayment_reference != self.name:
+				paid_entries.append({
+					"payment_date": d.payment_date,
+					"principal_amount": d.principal_amount,
+					"total_payment": d.total_payment,
+					"is_paid": 1,
+					"outsource": getattr(d, "outsource", 0),
+					"repayment_reference": d.repayment_reference,
+					"payment_reference": d.payment_reference,
+				})
 
-		# Remove split items
-		for item in items_to_remove:
-			staff_loan.remove(item)
+		# Determine next payment date
+		paid_dates = [e["payment_date"] for e in paid_entries]
+		if paid_dates:
+			next_date = max(paid_dates).replace(day=1) + relativedelta(months=1)
+		else:
+			next_date = (staff_loan.repayment_start_date or self.payment_date).replace(day=1)
 
-		# Recalculate balance_loan_amount and idx
-		balance = staff_loan.loan_amount
+		# Rebuild schedule
+		staff_loan.repayment_schedule = []
+
+		balance = flt(staff_loan.loan_amount)
+		for entry in paid_entries:
+			balance -= flt(entry["total_payment"])
+			entry["balance_loan_amount"] = balance
+			staff_loan.append("repayment_schedule", entry)
+
+		# Remaining balance (external payment reversed, so full remaining)
+		remaining_balance = balance
+
+		# Create new equal installments for remaining balance
+		if remaining_balance > 0 and monthly_repayment_amount > 0:
+			payment_date = next_date
+			bal = remaining_balance
+			while bal > 0:
+				installment = min(flt(bal), flt(monthly_repayment_amount))
+				bal = flt(bal - installment)
+				staff_loan.append("repayment_schedule", {
+					"payment_date": payment_date,
+					"principal_amount": installment,
+					"total_payment": installment,
+					"balance_loan_amount": bal,
+					"is_paid": 0,
+				})
+				payment_date = payment_date + relativedelta(months=1)
+
+		# Re-index and recalculate balances in correct order
 		sorted_schedule = sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))
+		balance = flt(staff_loan.loan_amount)
 		for i, d in enumerate(sorted_schedule):
-			if d.is_paid:
-				balance -= d.total_payment
-			d.balance_loan_amount = balance
 			d.idx = i + 1
+			if d.is_paid:
+				balance -= flt(d.total_payment)
+			d.balance_loan_amount = balance
 
 		staff_loan.save()
 

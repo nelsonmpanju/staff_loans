@@ -352,6 +352,12 @@ frappe.ui.form.on("Staff Loan", {
 				},__('Create'));
 			}
 
+			if (["Disbursed", "Partially Disbursed"].includes(frm.doc.status) && frm.doc.is_term_loan) {
+				frm.add_custom_button(__('Recalculate Schedule'), function() {
+					frm.trigger("recalculate_schedule");
+				});
+			}
+
 		}
 		frm.trigger("toggle_fields");
 	},
@@ -473,6 +479,26 @@ frappe.ui.form.on("Staff Loan", {
 	toggle_fields: function (frm) {
 		frm.toggle_enable("monthly_repayment_amount", frm.doc.repayment_method == "Repay Fixed Amount per Period")
 		frm.toggle_enable("repayment_periods", frm.doc.repayment_method == "Repay Over Number of Periods")
+	},
+
+	recalculate_schedule: function (frm) {
+		frappe.confirm(
+			__('This will cancel any linked Additional Salary entries for unpaid periods and rebuild the schedule. Continue?'),
+			function () {
+				frappe.call({
+					method: "staff_loans.staff_loan_management.doctype.staff_loan.staff_loan.recalculate_schedule",
+					args: { loan_name: frm.doc.name },
+					freeze: true,
+					freeze_message: __('Recalculating schedule...'),
+					callback: function (r) {
+						if (r.message && r.message.status === "success") {
+							frappe.msgprint(r.message.message);
+							frm.reload_doc();
+						}
+					}
+				});
+			}
+		);
 	}
 });
 // frappe.ui.form.on("Repayment", "is_paid", function(frm) {

@@ -4,7 +4,7 @@
 frappe.ui.form.on('Staff Loan Application', {
 	setup: function(frm) {
 		frm.make_methods = {
-			'Loan': function() { frm.trigger('create_loan') },
+			'Staff Loan': function() { frm.trigger('create_loan') },
 		}
 	},
 	refresh: function(frm) {

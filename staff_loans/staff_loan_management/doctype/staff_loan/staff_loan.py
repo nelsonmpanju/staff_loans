@@ -350,13 +350,7 @@ def get_total_loan_amount(applicant_type, applicant, company):
 		],
 	)
 
-	interest_amount = flt(
-		frappe.db.get_value(
-			"Loan Interest Accrual",
-			{"applicant_type": applicant_type, "company": company, "applicant": applicant, "docstatus": 1},
-			"sum(interest_amount - paid_interest_amount)",
-		)
-	)
+	interest_amount = 0.0
 
 	for loan in loan_details:
 		if loan.status in ("Disbursed", "Loan Closure Requested"):
@@ -382,6 +376,8 @@ def get_total_loan_amount(applicant_type, applicant, company):
 
 
 def get_sanctioned_amount_limit(applicant_type, applicant, company):
+	if not frappe.db.exists("DocType", "Sanctioned Loan Amount"):
+		return None
 	return frappe.db.get_value(
 		"Sanctioned Loan Amount",
 		{"applicant_type": applicant_type, "company": company, "applicant": applicant},
@@ -592,3 +588,202 @@ def disburse_opening_balance(loan_name):
 	))
 
 	return {"status": "success"}
+
+
+@frappe.whitelist()
+def recalculate_schedule(loan_name):
+	"""
+	Recalculate the repayment schedule for a single Staff Loan.
+	Verifies actual payments from Additional Salary and Staff Loan Repayment documents,
+	then redistributes the remaining balance equally across new monthly installments.
+
+	For existing data where schedule may be out of sync with actual payments,
+	this function checks submitted payment documents as the source of truth.
+	"""
+	from dateutil.relativedelta import relativedelta
+
+	staff_loan = frappe.get_doc("Staff Loan", loan_name)
+
+	if staff_loan.docstatus != 1:
+		frappe.throw(_("Loan must be submitted first"))
+
+	if staff_loan.status == "Closed":
+		frappe.throw(_("Cannot recalculate schedule for a closed loan"))
+
+	monthly_repayment_amount = staff_loan.monthly_repayment_amount
+	if not monthly_repayment_amount:
+		frappe.throw(_("Monthly Repayment Amount is not set"))
+
+	# Get staff loan salary component
+	enable_multi_company = frappe.db.get_single_value('Staff Loan Settings', 'enable_multi_company')
+	if enable_multi_company:
+		staff_loan_component = frappe.db.get_value("Staff Loan Company Setting",
+			{'company': staff_loan.company}, "staff_loan_component")
+	else:
+		staff_loan_component = frappe.db.get_single_value('Staff Loan Settings', 'salary_component')
+
+	# Step 1: Find all confirmed salary payments for this loan
+	# Key by Additional Salary reference NAME to prevent duplicates
+	confirmed_salary_payments = {}  # Key: reference (name), Value: {amount, reference, payment_date}
+
+	# Check schedule entries with payment_reference to submitted Additional Salary
+	for d in staff_loan.repayment_schedule:
+		if d.payment_reference:
+			add_sal = frappe.db.get_value("Additional Salary", d.payment_reference,
+				["docstatus", "amount", "payroll_date"], as_dict=True)
+			if add_sal and add_sal.docstatus == 1:
+				ref_name = d.payment_reference
+				if ref_name not in confirmed_salary_payments:
+					confirmed_salary_payments[ref_name] = {
+						"amount": flt(add_sal.amount),
+						"reference": ref_name,
+						"payment_date": d.payment_date
+					}
+
+	# Also check for Additional Salary with ref_docname linking (newer data)
+	if staff_loan_component:
+		additional_salaries = frappe.get_all("Additional Salary", filters={
+			"ref_doctype": "Staff Loan",
+			"ref_docname": loan_name,
+			"docstatus": 1,
+			"salary_component": staff_loan_component,
+		}, fields=["name", "amount", "payroll_date"])
+
+		for add_sal in additional_salaries:
+			ref_name = add_sal.name
+			payment_date = add_sal.payroll_date.replace(day=1) if add_sal.payroll_date else None
+			if payment_date and ref_name not in confirmed_salary_payments:
+				confirmed_salary_payments[ref_name] = {
+					"amount": flt(add_sal.amount),
+					"reference": ref_name,
+					"payment_date": payment_date
+				}
+
+	# Step 2: Find confirmed external/write-off payments
+	# Key by repayment reference NAME to prevent duplicates (same doc found via schedule + direct query)
+	confirmed_external_payments = {}  # Key: repayment_reference (name), Value: {amount, reference, type, payment_date}
+
+	# Check schedule entries with repayment_reference
+	for d in staff_loan.repayment_schedule:
+		if d.outsource and d.repayment_reference:
+			repayment = frappe.db.get_value("Staff Loan Repayment", d.repayment_reference,
+				["docstatus", "repayment_amount", "write_off_amount", "repayment_type", "payment_date"], as_dict=True)
+			if repayment and repayment.docstatus == 1:
+				ref_name = d.repayment_reference
+				if ref_name not in confirmed_external_payments:
+					amount = repayment.repayment_amount if repayment.repayment_type == "External Sources" else repayment.write_off_amount
+					confirmed_external_payments[ref_name] = {
+						"amount": flt(amount),
+						"reference": ref_name,
+						"type": repayment.repayment_type,
+						"payment_date": d.payment_date
+					}
+
+	# Also check Staff Loan Repayment docs directly
+	repayments = frappe.get_all("Staff Loan Repayment", filters={
+		"loan": loan_name,
+		"docstatus": 1,
+	}, fields=["name", "repayment_amount", "write_off_amount", "repayment_type", "payment_date"])
+
+	for rep in repayments:
+		ref_name = rep.name
+		if ref_name not in confirmed_external_payments:
+			amount = rep.repayment_amount if rep.repayment_type == "External Sources" else rep.write_off_amount
+			confirmed_external_payments[ref_name] = {
+				"amount": flt(amount),
+				"reference": ref_name,
+				"type": rep.repayment_type,
+				"payment_date": rep.payment_date
+			}
+
+	# Step 3: Cancel Additional Salary entries that are NOT confirmed
+	confirmed_refs = set(confirmed_salary_payments.keys())
+	for d in staff_loan.repayment_schedule:
+		if d.payment_reference and d.payment_reference not in confirmed_refs:
+			if frappe.db.exists("Additional Salary", {"name": d.payment_reference, "docstatus": 1}):
+				try:
+					add_sal = frappe.get_doc("Additional Salary", d.payment_reference)
+					add_sal.cancel()
+				except Exception:
+					pass
+
+	# Step 4: Rebuild schedule with confirmed payments
+	staff_loan.repayment_schedule = []
+	balance = flt(staff_loan.loan_amount)
+
+	# Collect all payment dates and sort
+	salary_payment_dates = [p["payment_date"] for p in confirmed_salary_payments.values()]
+	external_payment_dates = [p["payment_date"] for p in confirmed_external_payments.values()]
+	all_payment_dates = sorted(set(salary_payment_dates + external_payment_dates))
+
+	# Add confirmed salary payments to schedule (sorted by payment_date)
+	for payment in sorted(confirmed_salary_payments.values(), key=lambda x: x["payment_date"]):
+		balance -= flt(payment["amount"])
+		staff_loan.append("repayment_schedule", {
+			"payment_date": payment["payment_date"],
+			"principal_amount": payment["amount"],
+			"total_payment": payment["amount"],
+			"balance_loan_amount": balance,
+			"is_paid": 1,
+			"outsource": 0,
+			"payment_reference": payment["reference"],
+		})
+
+	# Add confirmed external payments to schedule (sorted by payment_date)
+	for payment in sorted(confirmed_external_payments.values(), key=lambda x: x["payment_date"]):
+		balance -= flt(payment["amount"])
+		staff_loan.append("repayment_schedule", {
+			"payment_date": payment["payment_date"],
+			"principal_amount": payment["amount"],
+			"total_payment": payment["amount"],
+			"balance_loan_amount": balance,
+			"is_paid": 1,
+			"outsource": 1,
+			"repayment_reference": payment["reference"],
+		})
+
+	# Step 5: Determine next payment date for new installments
+	if all_payment_dates:
+		last_payment = max(all_payment_dates)
+		next_date = last_payment.replace(day=1) + relativedelta(months=1)
+	elif staff_loan.repayment_start_date:
+		next_date = staff_loan.repayment_start_date.replace(day=1)
+	else:
+		next_date = getdate(nowdate()).replace(day=1)
+
+	# Step 6: Create new equal installments for remaining balance
+	remaining_balance = balance
+	if remaining_balance > 0 and monthly_repayment_amount > 0:
+		payment_date = next_date
+		bal = remaining_balance
+		while bal > 0:
+			installment = min(flt(bal), flt(monthly_repayment_amount))
+			bal = flt(bal - installment)
+			staff_loan.append("repayment_schedule", {
+				"payment_date": payment_date,
+				"principal_amount": installment,
+				"total_payment": installment,
+				"balance_loan_amount": bal,
+				"is_paid": 0,
+			})
+			payment_date = payment_date + relativedelta(months=1)
+
+	# Re-index and recalculate balances in correct order
+	sorted_schedule = sorted(staff_loan.repayment_schedule, key=lambda x: (x.payment_date, -x.is_paid))
+	balance = flt(staff_loan.loan_amount)
+	for i, d in enumerate(sorted_schedule):
+		d.idx = i + 1
+		if d.is_paid:
+			balance -= flt(d.total_payment)
+		d.balance_loan_amount = balance
+
+	staff_loan.save()
+
+	total_paid = flt(staff_loan.loan_amount) - balance
+	return {
+		"status": "success",
+		"message": _("Schedule recalculated: {0} paid, {1} remaining").format(
+			frappe.format_value(total_paid, {"fieldtype": "Currency"}),
+			frappe.format_value(remaining_balance, {"fieldtype": "Currency"})
+		)
+	}

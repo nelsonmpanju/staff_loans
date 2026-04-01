@@ -118,6 +118,8 @@ class StaffLoanApplication(Document):
 			self.loan_amount = self.maximum_loan_amount
 
 def get_sanctioned_amount_limit(applicant_type, applicant, company):
+	if not frappe.db.exists("DocType", "Sanctioned Loan Amount"):
+		return None
 	return frappe.db.get_value(
 		"Sanctioned Loan Amount",
 		{"applicant_type": applicant_type, "company": company, "applicant": applicant},
@@ -154,7 +156,7 @@ def create_loan(source_name, target_doc=None, submit=0):
 		source_name,
 		{
 			"Staff Loan Application": {
-				"doctype": "Loan",
+				"doctype": "Staff Loan",
 				"validation": {"docstatus": ["=", 1]},
 				"postprocess": update_accounts,
 			}
@@ -167,39 +169,6 @@ def create_loan(source_name, target_doc=None, submit=0):
 
 	return doclist
 
-
-@frappe.whitelist()
-def create_pledge(loan_application, loan=None):
-	loan_application_doc = frappe.get_doc("Loan Application", loan_application)
-
-	lsp = frappe.new_doc("Loan Security Pledge")
-	lsp.applicant_type = loan_application_doc.applicant_type
-	lsp.applicant = loan_application_doc.applicant
-	lsp.loan_application = loan_application_doc.name
-	lsp.company = loan_application_doc.company
-
-	if loan:
-		lsp.loan = loan
-
-	for pledge in loan_application_doc.proposed_pledges:
-
-		lsp.append(
-			"securities",
-			{
-				"loan_security": pledge.loan_security,
-				"qty": pledge.qty,
-				"loan_security_price": pledge.loan_security_price,
-				"haircut": pledge.haircut,
-			},
-		)
-
-	lsp.save()
-	lsp.submit()
-
-	message = _("Loan Security Pledge Created : {0}").format(lsp.name)
-	frappe.msgprint(message)
-
-	return lsp.name
 
 def get_total_loan_amount(applicant_type, applicant, company):
 	pending_amount = 0

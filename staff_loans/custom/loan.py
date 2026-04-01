@@ -177,7 +177,7 @@ def make_loan_disbursement_journal_entry(loan, company,applicant,debit_account,a
     disbursement_entry = frappe.new_doc("Journal Entry")
     disbursement_entry.voucher_type = "Journal Entry"
     disbursement_entry.company = company
-    disbursement_entry.posting_date = nowdate()
+    disbursement_entry.posting_date = ref_date or nowdate()
     disbursement_entry.cheque_no = loan
     disbursement_entry.cheque_date = ref_date
     applicant_name = frappe.db.get_value(applicant_type,applicant,"employee_name")
